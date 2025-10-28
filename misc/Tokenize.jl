@@ -3,7 +3,7 @@ using DataStructures:Trie
 using StringEncodings:decode
 using StatsBase:countmap
 export load_text_file, pre_tokenize, find_unique_chars, find_unique_words, 
-        TokenDict, tokenize, 
+        TokenDict, tokenize, build_trie, get_tokens,
         MostFrequent, WordPieceScore, bpe
 
 function pre_tokenize(s::AbstractString, skipdigits = false) 
@@ -49,42 +49,55 @@ function count_occurences(words, tokens)
     cnt
 end
 
+struct TokenInfo
+    id::Int32
+    parents::Union{Tuple{Int32,Int32},Nothing}
+    frequency::Int32
+    tok::String
+end
+
 mutable struct TokenDict
-    token_to_id::Dict{String,Int}
-    id_to_token::Dict{Int,String}
-    token_freq::Dict{String,Int}
+    id_to_token::Dict{Int,TokenInfo}
     next_token_id::Int
     trie::Union{Trie{Char,Int},Nothing}
 end
 
-function TokenDict(words)::TokenDict
-    unique_chars = sort!(collect(find_unique_chars(words)))
-    token_to_id = Dict{String,Int}();
-    id_to_token = Dict{Int,String}();
-    sizehint!(token_to_id,length(unique_chars));
-    sizehint!(id_to_token,length(unique_chars));
-    for (i,c) in enumerate(unique_chars)
-        tok = string(c)
-        token_to_id[tok] = i;
-        id_to_token[i] = tok;
-    end
-    next_token_id = length(token_to_id) + 1
-    token_freq = count_occurences(words, keys(token_to_id))
+function count_char_frequencies(words)
+    countmap( Iterators.flatten( collect.(words) ) )
+end
 
-    TokenDict(token_to_id,id_to_token,token_freq,next_token_id,nothing)
+function TokenDict(words)::TokenDict
+    char_freq = count_char_frequencies(words)
+    unique_chars = char_freq |> keys |> collect |> sort!
+    id_to_token = Dict{Int,TokenInfo}();
+    sizehint!(id_to_token,length(unique_chars));
+
+    for (i,c) in enumerate(unique_chars)
+        id_to_token[i] = TokenInfo(i, nothing, char_freq[c], string(c))
+    end
+    next_token_id = length(id_to_token) + 1
+    TokenDict(id_to_token,next_token_id,nothing)
+end
+
+function get_tokens(td::TokenDict, sorted::Bool = true)::Vector{String}
+    tokens = [ ti.tok for ti in values(td.id_to_token) ]
+    sorted ? sort(tokens) : tokens
 end
 
 function build_trie(td::TokenDict)::Trie{Char,Int}
-    td.trie = Trie{Char,Int}(td.token_to_id)
+    d = Dict{String,Int}( ti.tok => ti.id for ti in values(td.id_to_token) )
+    td.trie = Trie{Char,Int}(d)
+    td.trie
 end
 
-#works only for single char tokens for now
-function tokenize(str::AbstractString, td::TokenDict)::Vector{Vector{Int}}
-    [[td.token_to_id[string(char)] for char in word] for word in pre_tokenize(str)]
+function tokenize_chars(td::TokenDict, str::AbstractString)::Vector{Vector{Int}}
+    chars = Dict{Char,Int}( ti.tok[1] => ti.id for ti in td.id_to_token if ti.parents === nothing )
+    [chars[c] for c in string(str)] # assume already pre_tokenized
 end
 
-function tokenize(vec, td::TokenDict)::Vector{Vector{Int}}
-    collect(Iterators.flatten([[[td.token_to_id[string(char)] for char in word] for word in pre_tokenize(str)] for str in vec]))
+function tokenize_chars(td::TokenDict, words)::Vector{Vector{Int}}
+    chars = Dict{Char,Int}( ti.tok[1] => ti.id for ti in values(td.id_to_token) if ti.parents === nothing )
+    [ [chars[c] for c in string(str)] for str in words ]
 end
 
 struct SearchState
@@ -92,7 +105,7 @@ struct SearchState
     pos::Int
 end
 
-function tokenize_word(str::AbstractString, tr::Trie{Char,Int})::Vector{Int}
+function tokenize_word(tr::Trie{Char,Int},str::AbstractString)::Vector{Int}
     stack = [ SearchState([],1) ]
     best = []
     N = length(str)
@@ -121,15 +134,14 @@ function tokenize_word(str::AbstractString, tr::Trie{Char,Int})::Vector{Int}
     best[1] #how to choose among multiple best tokenizations?
 end
 
-function tokenize(words, tr::Trie{Char,Int})
-    [ tokenize_word(w,tr) for w in words]
+function tokenize(tr::Trie{Char,Int}, words)
+    [ tokenize_word(tr,w) for w in words]
 end
 
 function append!(td::TokenDict, tok::String)
-    if tok ∉ keys(td.token_to_id)
+    if all( ti -> ti.tok != tok, values(td.id_to_token) )
         tid = td.next_token_id
-        td.token_to_id[tok] = tid
-        td.id_to_token[tid] = tok
+        td.id_to_token[tid] = TokenInfo(tid, nothing, 1, tok)
         td.next_token_id += 1
         true
     else
@@ -143,13 +155,12 @@ function append!(td::TokenDict, vec::Vector{String})
     end
 end
 
-function new_token_from_pair(td::TokenDict, pair::Tuple{Int,Int})
-    tok = td.id_to_token[pair[1]] * td.id_to_token[pair[2]]
+function new_token_from_pair(td::TokenDict, pair::Tuple{Int,Int}, freq::Int)
+    tok = td.id_to_token[pair[1]].tok * td.id_to_token[pair[2]].tok
     tid = td.next_token_id
-    td.token_to_id[ tok ] = tid
-    td.id_to_token[ tid ] = tok
+    td.id_to_token[tid] = TokenInfo(tid, pair, freq, tok)
     td.next_token_id += 1
-    tok,tid
+    tok, tid
 end
 
 function replace_pairs(vec::Vector{Int}, pair::Tuple{Int,Int}, id::Int)
@@ -183,9 +194,8 @@ end
 
 function pair_eval(pairs::Vector{Tuple{Int,Int}}, td::TokenDict, p::WordPieceScore)
     cnt = countmap(pairs)
-    tf = td.token_freq
     i2t = td.id_to_token
-    score = Dict(p => cnt[p] / (tf[i2t[p[1]]] * tf[i2t[p[2]]]) for p in pairs)
+    score = Dict(p => cnt[p] / (i2t[p[1]].frequency * i2t[p[2]].frequency) for p in pairs)
     freq,pair = findmax(score)
     pair,cnt[pair]
 end
@@ -200,8 +210,7 @@ end
 
 function bpe(words::AbstractVector{<:AbstractString}, n_iter::Union{Int,Nothing}=nothing; eval_policy::PairEvalPolicy = MostFrequent(), start_token::String = "<S>", end_token::String = "<E>")::TokenDict
     token_dict = TokenDict(words)
-    append!(token_dict,[start_token,end_token])
-    tokenized_quora = tokenize(words, token_dict)
+    tokenized_quora = tokenize_chars(token_dict, words)
 
     if isnothing(n_iter)
         n_iter = typemax(Int64) # set to max value for Int64
@@ -210,9 +219,7 @@ function bpe(words::AbstractVector{<:AbstractString}, n_iter::Union{Int,Nothing}
     for _ in 1:n_iter
         pair,freq = pair_eval(get_pairs(tokenized_quora), 
                                     token_dict, eval_policy)
-        nt,new_token_id = new_token_from_pair(token_dict,pair)
-        t1,t2 = token_dict.id_to_token[pair[1]], token_dict.id_to_token[pair[2]]
-        token_dict.token_freq[nt] = freq
+        nt,new_token_id = new_token_from_pair(token_dict,pair,freq)
         new_tokenized_quora = replace_pairs(tokenized_quora, pair, new_token_id)
         if all( v->length(v) == 1, new_tokenized_quora)
             break
